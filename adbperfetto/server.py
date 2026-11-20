@@ -25,6 +25,8 @@ class RecordBody(BaseModel):
     text: str | None = None
     duration_min: float | None = None
     mobilelog: bool = False
+    sf: bool = False
+    sf_interval_ms: int = 200
 
 
 class FlightBody(BaseModel):
@@ -140,7 +142,8 @@ def create_app(manager, presets, settings, quit_hook=None,
         duration_ms = (int(body.duration_min * 60000)
                        if body.duration_min else None)
         session = call(manager.start_record, serial, text, name,
-                       duration_ms, body.mobilelog)
+                       duration_ms, body.mobilelog,
+                       sf=body.sf, sf_interval_ms=body.sf_interval_ms)
         return {"ok": True, "status": session.status}
 
     @app.post("/api/devices/{serial}/flight")

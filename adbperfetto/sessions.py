@@ -33,6 +33,7 @@ from . import BUILD, VERSION, pbtx
 from .adb import AdbError, is_wifi_serial
 from .device import DeviceInfo, probe
 from .mobilelog import MobileLog, other_log_names
+from .sf import SfCapture
 from . import outputs
 
 log = logging.getLogger(__name__)
@@ -199,6 +200,9 @@ class _Session:
         self.pid = None
         self.mobilelog = None
         self._mobilelog_running = False
+        self.sf = None
+        self._want_sf = False
+        self._sf_interval_ms = 200
         self.ended_by_duration = False
         self._thread = None
         self._resumed = False  # monitor thread started in this process
@@ -296,6 +300,10 @@ class _Session:
             "snapshots": list(self.snapshots),
             "mobilelog": (self.mobilelog.state_dict()
                           if self.mobilelog else None),
+            "sf": (self.sf.state_dict() if self.sf else (
+                {"enabled": True, "interval_ms": self._sf_interval_ms,
+                 "output_dir": "", "dump_count": 0}
+                if self._want_sf else None)),
             "outputs": list(self.outputs),
             "duration_ms": self.duration_ms,
             "lifetime_ms": self.lifetime_ms,
@@ -317,6 +325,7 @@ class _Session:
                 "log_bytes": getattr(self, "_log_bytes", 0),
                 "paused": paused,
             }
+        sf = self.sf.api_dict() if self.sf else None
         return {
             "mode": self.mode,
             "status": self.status,
@@ -338,6 +347,7 @@ class _Session:
             "buffer_kb": (pbtx.total_buffer_kb(self._config_text)
                           if self._config_text else 0),
             "mobilelog": mobilelog,
+            "sf": sf,
             "stop_requested": self.stop_requested,
             "ended_by_duration": self.ended_by_duration,
             "outputs": list(self.outputs),
@@ -388,6 +398,14 @@ class _Session:
             self.mobilelog = MobileLog.from_state(
                 self.adb, self.serial, ml,
                 on_message=self._set_message)
+        sf = record.get("sf")
+        if sf and sf.get("enabled"):
+            self._want_sf = True
+            self._sf_interval_ms = int(sf.get("interval_ms") or 200)
+            if sf.get("output_dir"):
+                self.sf = SfCapture.from_state(
+                    self.adb, self.serial, sf,
+                    on_message=self._set_message)
 
     # -- pull helper ------------------------------------------------------
 
@@ -459,11 +477,14 @@ class RecordSession(_Session):
     mode = "record"
 
     def start(self, config_text: str, preset_name: str,
-              duration_ms: int | None, mobilelog: bool = False):
+              duration_ms: int | None, mobilelog: bool = False,
+              sf: bool = False, sf_interval_ms: int = 200):
         self.preset_name = preset_name
         self.duration_ms = duration_ms
         self._config_text = config_text
         self._want_mobilelog = mobilelog
+        self._want_sf = bool(sf)
+        self._sf_interval_ms = max(50, int(sf_interval_ms or 200))
         # Preflight: refuse when a detached session is already running.
         result = self._shell(f"perfetto --is_detached={DETACH_KEY}",
                              timeout=10)
@@ -497,6 +518,7 @@ class RecordSession(_Session):
                     return
             if self.status == "starting":
                 self.status = "recording"
+            self._ensure_sf_running()
             target = self._run_resumed
         self._thread = threading.Thread(target=target, daemon=True)
         self._thread.start()
@@ -523,8 +545,36 @@ class RecordSession(_Session):
         self.status = "abandoned"
         self._mark_stopped()
         self.message = "Left running on the device"
+        self._stop_sf()
 
     # -- worker -----------------------------------------------------------
+
+    def _sf_staging_dir(self) -> Path:
+        ts = datetime.fromtimestamp(self.started_at)
+        return (self.output_dir /
+                f".sf_staging_{outputs.safe_filename(self.serial)}_"
+                f"{ts:%Y%m%d_%H%M%S}")
+
+    def _ensure_sf_running(self):
+        if not self._want_sf:
+            return
+        if self.sf is None:
+            self.sf = SfCapture(
+                self.adb, self.serial, self._sf_staging_dir(),
+                interval_ms=self._sf_interval_ms,
+                on_message=self._set_message)
+        if not self.sf.running:
+            self.sf.start()
+            self._persist()
+            self.on_change()
+
+    def _stop_sf(self):
+        if self.sf is None:
+            return
+        try:
+            self.sf.stop()
+        except Exception as exc:
+            self._set_message(f"SF capture stop failed: {exc}")
 
     def _run_new(self):
         try:
@@ -557,10 +607,12 @@ class RecordSession(_Session):
                     "Could not start the Perfetto trace: "
                     + (filter_perfetto_stderr(launched.stderr)
                        or launched.stdout.strip() or "unknown error"))
+            self._ensure_sf_running()
             self._set_status("recording", "Recording")
             self._monitor_and_finish()
         except Exception as exc:
             message = str(exc)
+            self._stop_sf()
             if self.mobilelog is not None and (
                     self.mobilelog.started
                     or self.mobilelog.paused_mask):
@@ -654,6 +706,7 @@ class RecordSession(_Session):
 
     def _finish(self):
         self._set_status("pulling", "Pulling the trace...")
+        self._stop_sf()
         if self.mobilelog:
             try:
                 self.mobilelog.stop()
@@ -662,7 +715,7 @@ class RecordSession(_Session):
         ts = datetime.fromtimestamp(self.started_at)
         timestamp = f"{ts:%Y%m%d_%H%M%S}"
         out = self.output_dir
-        if not self.mobilelog:
+        if not self.mobilelog and not self.sf:
             dest = outputs.unique_path(
                 out / outputs.record_name(self.model_name, timestamp))
             part = self._part_path(dest)
@@ -677,7 +730,7 @@ class RecordSession(_Session):
                                "ok": size > 0, "size": size}]
             self.outputs = [str(dest)]
         else:
-            if not self._finish_mobilelog(out, ts, timestamp):
+            if not self._finish_bundle(out, ts, timestamp):
                 return
         self._set_status("done", "Done")
 
@@ -687,23 +740,32 @@ class RecordSession(_Session):
         except AdbError:
             pass
 
-    def _finish_mobilelog(self, out: Path, ts: datetime,
-                          timestamp: str) -> bool:
+    def _finish_bundle(self, out: Path, ts: datetime,
+                       timestamp: str) -> bool:
         model = outputs.safe_filename(self.model_name)
         build = outputs.safe_filename(getattr(self.info, "build_id", ""))
         root = outputs.unique_path(out / f"{model}_{timestamp}")
         (root / "trace").mkdir(parents=True)
-        (root / "mobilelog").mkdir()
+        if self.mobilelog:
+            (root / "mobilelog").mkdir()
         trace_dest = root / "trace" / f"{model}_{timestamp}.pftrace"
         if not self._pull_with_retry(self.remote_path, trace_dest,
                                      self.size_bytes):
             return False
         self._rm_remote()
-        if self.mobilelog.log_path:
+        if self.mobilelog and self.mobilelog.log_path:
             log_dir = root / "mobilelog" / \
                 self.mobilelog.log_path.rsplit("/", 1)[-1]
             if not self._pull_with_retry(self.mobilelog.log_path, log_dir):
                 return False
+        if self.sf is not None:
+            sf_dest = root / "sf"
+            staging = Path(self.sf.output_dir)
+            if staging.exists():
+                shutil.copytree(staging, sf_dest, dirs_exist_ok=True)
+                shutil.rmtree(staging, ignore_errors=True)
+            else:
+                sf_dest.mkdir(parents=True, exist_ok=True)
         stopped = datetime.now()
         device_time = ""
         props_text = ""
@@ -714,6 +776,20 @@ class RecordSession(_Session):
                 props_text = props.stdout
         except AdbError:
             pass
+        log_path = self.mobilelog.log_path if self.mobilelog else ""
+        original_mask = (self.mobilelog.original_mask
+                         if self.mobilelog else None)
+        paused_names = (other_log_names(self.mobilelog.original_mask or 0)
+                        if self.mobilelog else "")
+        logs_restored = (self.mobilelog.logs_restored
+                         if self.mobilelog else False)
+        extra = ""
+        if self.sf is not None:
+            extra = (
+                f"SF capture: yes\n"
+                f"SF interval ms: {self.sf.interval_ms}\n"
+                f"SF dump count: {self.sf.dump_count}\n"
+            )
         info_text = outputs.device_info_text(
             self.info, self.serial, mode="record",
             preset_name=self.preset_name,
@@ -721,11 +797,12 @@ class RecordSession(_Session):
             stopped_iso=stopped.isoformat(timespec="seconds"),
             duration_s=time.time() - self.started_at,
             device_time=device_time,
-            log_path=self.mobilelog.log_path,
-            original_mask=self.mobilelog.original_mask,
-            paused_names=other_log_names(self.mobilelog.original_mask or 0),
-            logs_restored=self.mobilelog.logs_restored,
-            ended_early=self.ended_by_duration)
+            log_path=log_path,
+            original_mask=original_mask,
+            paused_names=paused_names,
+            logs_restored=logs_restored,
+            ended_early=self.ended_by_duration,
+            extra=extra)
         (root / "device_info.txt").write_text(info_text, encoding="utf-8")
         if props_text:
             (root / "getprop.txt").write_text(props_text, encoding="utf-8")
@@ -1387,7 +1464,8 @@ class SessionManager:
         return None
 
     def start_record(self, serial: str, config_text: str, preset_name: str,
-                     duration_ms: int | None, mobilelog: bool = False):
+                     duration_ms: int | None, mobilelog: bool = False,
+                     sf: bool = False, sf_interval_ms: int = 200):
         self._require_device(serial)
         with self._lock:
             if self._active_session(serial):
@@ -1396,7 +1474,8 @@ class SessionManager:
             session = RecordSession(
                 self.adb, serial, info=self._info(serial),
                 **self._session_kwargs())
-            session.start(config_text, preset_name, duration_ms, mobilelog)
+            session.start(config_text, preset_name, duration_ms, mobilelog,
+                          sf=sf, sf_interval_ms=sf_interval_ms)
             self.sessions[serial] = session
             self.orphans.pop(serial, None)
         self._bump()

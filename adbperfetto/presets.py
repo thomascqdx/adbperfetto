@@ -153,6 +153,8 @@ _PREF_TYPES = {
     "durationSet": bool,
     "noLimit": bool,
     "mobilelog": bool,
+    "sf": bool,
+    "sfIntervalMs": int,
     "lifetimeH": int,
 }
 

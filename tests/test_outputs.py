@@ -62,6 +62,20 @@ class IntegrityTests(unittest.TestCase):
             self.assertEqual(checks["Perfetto trace"][1], 3)
             self.assertEqual(checks["MobileLog session"][1], 8)
 
+    def test_sf_only_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "trace").mkdir()
+            (root / "trace" / "a.pftrace").write_bytes(b"123")
+            sf = root / "sf"
+            sf.mkdir()
+            (sf / "sf_20260101_120000_000.txt").write_text("sf")
+            (root / "device_info.txt").write_text("info")
+            checks = check_integrity(root)
+            self.assertNotIn("MobileLog session", checks)
+            self.assertTrue(checks["SF dumps"][0])
+            self.assertEqual(checks["SF dumps"][1], 2)
+
 
 class ArchiveTests(unittest.TestCase):
     def test_write_zip(self):

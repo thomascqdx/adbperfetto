@@ -232,6 +232,31 @@ class RecordSessionTests(unittest.TestCase):
             self.assertEqual(session.api_dict()["mode"], "record")
             self.assertFalse(session.ended_by_duration)
 
+    def test_sf_capture_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adb = make_record_adb()
+
+            @adb.on(r"dumpsys SurfaceFlinger")
+            def _sf(ctx):
+                return Result(0, "SurfaceFlinger dumpsys\n", "")
+
+            session = RecordSession(**record_kwargs(tmp, adb))
+            session.start(CONFIG, "test", 60000, sf=True, sf_interval_ms=50)
+            self.assertTrue(wait_for(
+                lambda: session.status == "recording"
+                and session.sf is not None
+                and session.sf.dump_count >= 1, 5))
+            self.assertTrue(session.api_dict()["sf"]["running"])
+            session.stop()
+            self.assertTrue(wait_for(lambda: session.status == "done", 10))
+            zips = list((Path(tmp) / "out").glob("*.zip"))
+            self.assertEqual(len(zips), 1)
+            self.assertIn(str(zips[0]), session.outputs)
+            labels = {item["label"] for item in session.checklist}
+            self.assertIn("SF dumps", labels)
+            self.assertIn("Perfetto trace", labels)
+            self.assertFalse(session.sf.running)
+
     def test_started_at_tracks_launch(self):
         """started_at is stamped at the perfetto launch, not at click."""
         with tempfile.TemporaryDirectory() as tmp:

@@ -1174,6 +1174,9 @@ main {
   gap: 14px;
   align-items: start;
 }
+.artifacts-span {
+  grid-column: 1 / -1;
+}
 
 .module-card {
   background: var(--plate);
@@ -1306,7 +1309,8 @@ main {
 }
 .field-meta:empty { display: none; }
 
-.mobilelog-row {
+.mobilelog-row,
+.sf-row {
   padding: 11px 12px;
   border-radius: 6px;
   background: var(--well);
@@ -1315,13 +1319,20 @@ main {
   flex-direction: column;
   gap: 5px;
 }
-.mobilelog-row .field.check .field-label {
+.mobilelog-row .field.check .field-label,
+.sf-row .field.check .field-label {
   font-weight: 600;
   color: var(--ink);
 }
-.mobilelog-hint {
+.mobilelog-hint,
+.sf-hint {
   font-size: 11.5px;
   line-height: 1.45;
+}
+.sf-card .param-row .field {
+  width: 100%;
+  justify-content: space-between;
+  flex-wrap: wrap;
 }
 
 /* ---------------------------------------------------------------- snapshots & saved bay */

@@ -60,17 +60,29 @@ def check_integrity(root) -> dict:
     missing_logs = [name for name in LOG_TYPES
                     if not any(p.name.startswith(name) for p in files)]
     info = root / "device_info.txt"
-    return {
+    checks = {
         "Perfetto trace": (
             trace_size > 0, trace_size,
             [] if trace_size else ["Perfetto trace"]),
-        "MobileLog session": (
-            not missing_logs, sum(p.stat().st_size for p in files),
-            missing_logs),
         "device_info.txt": (
             info.is_file(), info.stat().st_size if info.is_file() else 0,
             [] if info.is_file() else ["device_info.txt"]),
     }
+    # Keep MobileLog in the checklist whenever the folder exists, or when
+    # neither optional sidecars exist (legacy mobilelog-only bundles).
+    sf_root = root / "sf"
+    sf_files = ([p for p in sf_root.rglob("sf_*.txt") if p.is_file()]
+                if sf_root.exists() else [])
+    if log_root.exists() or not sf_root.exists():
+        checks["MobileLog session"] = (
+            not missing_logs, sum(p.stat().st_size for p in files),
+            missing_logs)
+    if sf_root.exists():
+        sf_size = sum(p.stat().st_size for p in sf_files)
+        checks["SF dumps"] = (
+            len(sf_files) > 0, sf_size,
+            [] if sf_files else ["SF dumps"])
+    return checks
 
 
 def checklist_items(checks: dict) -> list[dict]:

@@ -87,6 +87,24 @@ function wantMobilelog(dev, prefs) {
   return prefs.mobilelog === undefined ? true : !!prefs.mobilelog;
 }
 
+function wantSf(prefs) {
+  return !!prefs.sf;
+}
+
+function sfIntervalMs(prefs) {
+  const raw = parseInt(prefs.sfIntervalMs, 10);
+  return Number.isFinite(raw) && raw >= 50 ? raw : 200;
+}
+
+function startRecordLabel(dev, prefs) {
+  const ml = wantMobilelog(dev, prefs);
+  const sf = wantSf(prefs);
+  if (ml && sf) return t("btn.startRecordMlSf");
+  if (ml) return t("btn.startRecordMl");
+  if (sf) return t("btn.startRecordSf");
+  return t("btn.startRecord");
+}
+
 function safeFilename(value) {
   return String(value || "")
     .replace(/[^A-Za-z0-9._-]+/g, "_")
@@ -300,6 +318,8 @@ export function createCapture(deps) {
       (s.checklist || []).length,
       (s.disconnects || []).length,
       s.mobilelog ? 1 : 0,
+      s.sf ? 1 : 0,
+      s.sf ? (s.sf.dump_count || 0) : 0,
       dev.orphan ? 1 : 0,
       ui.orphanHidden.has(dev.serial) ? 1 : 0,
       getPrefs(dev.serial),
@@ -470,8 +490,7 @@ export function createCapture(deps) {
       if (!orphanShown) {
         const mode = prefs.mode || "record";
         const label = mode === "record"
-          ? (wantMobilelog(dev, prefs) ? t("btn.startRecordMl")
-                                       : t("btn.startRecord"))
+          ? startRecordLabel(dev, prefs)
           : t("btn.startFlight");
         const btn = triggerButton("btn primary big", "rec", label,
                                   () => startSession(dev, prefs, mode));
@@ -610,6 +629,7 @@ export function createCapture(deps) {
     if (ACTIVE.has(s.status)) {
       if (mode === "record") {
         if (s.mobilelog) defs.push(["mlog", t("readout.mobilelog")]);
+        if (s.sf) defs.push(["sf", t("readout.sf")]);
       } else {
         defs.push(["memory", t("readout.memory")]);
       }
@@ -778,6 +798,72 @@ export function createCapture(deps) {
     wrap.appendChild(el("div", "hint dim mobilelog-hint",
                         t("record.mobilelogHint")));
     return wrap;
+  }
+
+  function sfModule(dev, prefs) {
+    const s = dev.session;
+    const running = s && ACTIVE.has(s.status);
+    const mode = running ? s.mode : (prefs.mode || "record");
+    const card = el("section", "module-card sf-card");
+    const head = el("div", "module-head");
+    head.appendChild(el("span", "module-title", t("sf.title")));
+    if (running) {
+      head.appendChild(el("span", "module-badge", t("sf.locked")));
+    }
+    card.appendChild(head);
+
+    const body = el("div", "module-body");
+    if (mode !== "record") {
+      body.appendChild(el("div", "hint dim", t("record.sfHint")));
+      card.appendChild(body);
+      return card;
+    }
+
+    const intervalRow = el("div", "param-row");
+    const interval = document.createElement("input");
+    interval.type = "number";
+    interval.id = "inp-sf-interval";
+    interval.min = "50";
+    interval.max = "60000";
+    interval.step = "50";
+    interval.value = String(sfIntervalMs(prefs));
+    interval.disabled = !!running;
+    interval.addEventListener("change", () => {
+      deps.setPrefs(dev.serial, {
+        sfIntervalMs: parseInt(interval.value, 10) || 200,
+      });
+    });
+    const capsule = el("span", "input-capsule");
+    capsule.append(interval, el("span", "field-suffix", t("record.sfMs")));
+    const intervalLabel = el("label", "field");
+    intervalLabel.append(
+      el("span", "field-label", t("record.sfInterval")), capsule);
+    intervalRow.appendChild(intervalLabel);
+    body.appendChild(intervalRow);
+
+    const wrap = el("div", "sf-row");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.className = "switch";
+    box.id = "inp-sf";
+    box.checked = wantSf(prefs);
+    box.disabled = !!running;
+    box.addEventListener("change", () => {
+      deps.setPrefs(dev.serial, { sf: box.checked });
+    });
+    const sfLabel = el("label", "field check");
+    sfLabel.append(box, el("span", "field-label", t("record.sf")));
+    wrap.appendChild(sfLabel);
+    wrap.appendChild(el("div", "hint dim sf-hint", t("record.sfHint")));
+    body.appendChild(wrap);
+
+    if (s && s.sf && ACTIVE.has(s.status)) {
+      body.appendChild(el(
+        "div", "hint dim",
+        `${t("readout.sf")}: ${s.sf.dump_count || 0}`));
+    }
+    card.appendChild(body);
+    return card;
   }
 
   function setupModule(dev, prefs) {
@@ -1028,6 +1114,8 @@ export function createCapture(deps) {
             ? null
             : parseFloat(ui.refs.duration?.value || "0") || null,
           mobilelog: wantMobilelog(dev, prefs),
+          sf: wantSf(prefs),
+          sf_interval_ms: sfIntervalMs(prefs),
         });
       } else {
         await api.flight(dev.serial, {
@@ -1114,6 +1202,8 @@ export function createCapture(deps) {
     set("ro-mlog",
         s.mobilelog && s.mobilelog.running
           ? fmtSize(s.mobilelog.log_bytes) : "—");
+    set("ro-sf",
+        s.sf ? String(s.sf.dump_count || 0) : "—");
     const fill = document.getElementById("pullbar-fill");
     if (fill) {
       fill.style.width = `${Math.round((s.pull_progress || 0) * 100)}%`;
@@ -1143,13 +1233,23 @@ export function createCapture(deps) {
     inner.appendChild(statusSection(dev));
 
     const grid = el("div", "bench-grid");
-    grid.append(setupModule(dev, prefs), artifactsModule(dev));
+    const mode = (dev.session && ACTIVE.has(dev.session.status))
+      ? dev.session.mode : (prefs.mode || "record");
+    if (mode === "record") {
+      grid.append(setupModule(dev, prefs), sfModule(dev, prefs));
+      const artifacts = artifactsModule(dev);
+      artifacts.classList.add("artifacts-span");
+      grid.appendChild(artifacts);
+    } else {
+      grid.append(setupModule(dev, prefs), artifactsModule(dev));
+    }
     inner.appendChild(grid);
 
     ui.refs.duration = host.querySelector("#inp-duration");
     ui.refs.lifetime = host.querySelector("#inp-lifetime");
+    ui.refs.sfInterval = host.querySelector("#inp-sf-interval");
     for (const id of ["elapsed", "size", "snaps", "memory", "phone",
-                      "mlog", "target", "idle-buf"]) {
+                      "mlog", "sf", "target", "idle-buf"]) {
       ui.refs["ro-" + id] = host.querySelector("#ro-" + id);
     }
 
